@@ -12,6 +12,14 @@ namespace StreamCompaction {
             return timer;
         }
 
+        void do_scan(int n, int *odata, const int *idata) {
+            int prev = 0;
+            for (int i = 0; i < n; i++) {
+                odata[i] = prev;
+                prev += idata[i];
+            }
+        }
+
         /**
          * CPU scan (prefix sum).
          * For performance analysis, this is supposed to be a simple for loop.
@@ -19,7 +27,7 @@ namespace StreamCompaction {
          */
         void scan(int n, int *odata, const int *idata) {
             timer().startCpuTimer();
-            // TODO
+            do_scan(n, odata, idata);
             timer().endCpuTimer();
         }
 
@@ -30,9 +38,31 @@ namespace StreamCompaction {
          */
         int compactWithoutScan(int n, int *odata, const int *idata) {
             timer().startCpuTimer();
-            // TODO
+            int num_out = 0;
+            for (int i = 0; i < n; i++) {
+                if (idata[i] != 0) {
+                    odata[num_out] = idata[i];
+                    num_out++;
+                }
+            }
             timer().endCpuTimer();
-            return -1;
+            return num_out;
+        }
+
+        static void check_to_include(int n, int *odata, const int *idata) {
+            for (int i = 0; i < n; i++) {
+                odata[i] = idata[i] != 0;
+            }
+        }
+
+        static void scatter(int n, int *odata, const int *idata, const int *indexes, const int *to_incl_arr) {
+            for (int i = 0; i < n; i++) {
+                if (to_incl_arr[i] == 0) {
+                    continue;
+                }
+
+                odata[indexes[i]] = idata[i];
+            }
         }
 
         /**
@@ -42,9 +72,16 @@ namespace StreamCompaction {
          */
         int compactWithScan(int n, int *odata, const int *idata) {
             timer().startCpuTimer();
-            // TODO
+            int *to_incl_arr = (int*)malloc(sizeof(int) * n);
+            check_to_include(n, to_incl_arr, idata);
+            int *buf = (int*)malloc(sizeof(int) * n);
+            do_scan(n, buf, to_incl_arr);
+            int size_out = buf[n-1] + to_incl_arr[n-1];
+            scatter(n, odata, idata, buf, to_incl_arr);
+            free(buf);
+            free(to_incl_arr);
             timer().endCpuTimer();
-            return -1;
+            return size_out;
         }
     }
 }
