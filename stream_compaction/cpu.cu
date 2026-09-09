@@ -71,6 +71,10 @@ namespace StreamCompaction {
          * @returns the number of elements remaining after compaction.
          */
         int compactWithScan(int n, int *odata, const int *idata) {
+            if (n == 0) {
+                return 0;
+            }
+            
             timer().startCpuTimer();
             int *to_incl_arr = (int*)malloc(sizeof(int) * n);
             check_to_include(n, to_incl_arr, idata);
