@@ -110,10 +110,11 @@ void scan(int n, int *odata, const int *idata) {
   cudaMemset(data_device+n, 0, (size - n) * sizeof(int));
 
   timer().startGpuTimer();
-  parallel_scan(n, data_device);
+  parallel_scan(size, data_device);
   timer().endGpuTimer();
 
   cudaMemcpy(odata, data_device, sizeof(int) * n, cudaMemcpyDeviceToHost);
+  cudaFree(data_device);
 }
 
 /**
