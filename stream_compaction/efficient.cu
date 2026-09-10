@@ -55,7 +55,7 @@ __global__ void kernDownSweep(int n, int *data) {
   }
 
   int max_d = log2ceil(n) - 1;
-  int d_pow = (int) powf(2, max_d);
+  int d_pow = (int)powf(2, max_d);
   for (int d = max_d; d >= 0; d--) {
     if ((n - tid) % (d_pow * 2) == 0) {
       int t = data[tid + d_pow - 1];
@@ -80,15 +80,41 @@ int round_to_next_pow2(int num) {
   return n;
 }
 
-bool is_power_of_2(unsigned int x) {
-    return x && ((x & (x - 1)) == 0);
+bool is_power_of_2(unsigned int x) { return x && ((x & (x - 1)) == 0); }
+
+void parallel_scan_power2(int n, int *data_device) {
+  int numBlocks = (n + threadsPerBlock - 1) / threadsPerBlock;
+
+  kernUpSweep<<<numBlocks, threadsPerBlock>>>(n, data_device);
+  kernDownSweep<<<numBlocks, threadsPerBlock>>>(n, data_device);
 }
 
 void parallel_scan(int n, int *data_device) {
-  int numBlocks = (n + threadsPerBlock - 1) / threadsPerBlock;  
-  
-  kernUpSweep<<<numBlocks, threadsPerBlock>>>(n, data_device);
-  kernDownSweep<<<numBlocks, threadsPerBlock>>>(n, data_device);
+  if (n == 0) {
+    return;
+  }
+
+  int size = n;
+  if (!is_power_of_2(n)) {
+    size = round_to_next_pow2(n);
+  }
+
+  if (size == n) {
+    parallel_scan_power2(size, data_device);
+    return;
+  }
+
+  int *data_device_padded;
+  cudaMalloc((void **)&data_device_padded, sizeof(int) * size);
+  cudaMemcpy(data_device_padded, data_device, sizeof(int) * n,
+             cudaMemcpyDeviceToDevice);
+  cudaMemset(data_device_padded + n, 0, (size - n) * sizeof(int));
+
+  parallel_scan_power2(size, data_device_padded);
+
+  cudaMemcpy(data_device, data_device_padded, sizeof(int) * n,
+             cudaMemcpyDeviceToDevice);
+  cudaFree(data_device_padded);
 }
 
 /**
@@ -99,18 +125,12 @@ void scan(int n, int *odata, const int *idata) {
     return;
   }
 
-  int size = n;
-  if (!is_power_of_2(n)) {
-    size = round_to_next_pow2(n);
-  }
-
   int *data_device;
-  cudaMalloc((void **)&data_device, sizeof(int) * size);
+  cudaMalloc((void **)&data_device, sizeof(int) * n);
   cudaMemcpy(data_device, idata, sizeof(int) * n, cudaMemcpyHostToDevice);
-  cudaMemset(data_device+n, 0, (size - n) * sizeof(int));
 
   timer().startGpuTimer();
-  parallel_scan(size, data_device);
+  parallel_scan(n, data_device);
   timer().endGpuTimer();
 
   cudaMemcpy(odata, data_device, sizeof(int) * n, cudaMemcpyDeviceToHost);
@@ -127,51 +147,55 @@ void scan(int n, int *odata, const int *idata) {
  * @returns      The number of elements remaining after compaction.
  */
 int compact(int n, int *odata, const int *idata) {
-  
+
   // Do padding if not power of 2
   int size = n;
   if (!is_power_of_2(n)) {
     size = round_to_next_pow2(n);
   }
-  
+
   int numBlocks = (size + threadsPerBlock - 1) / threadsPerBlock;
-  
+
   // Setup device global memory
   int *d_idata;
   int *d_odata;
   int *d_bools;
   int *d_indices;
-  
+
   cudaMalloc((void **)&d_idata, sizeof(int) * size);
   cudaMemcpy(d_idata, idata, sizeof(int) * n, cudaMemcpyHostToDevice);
-  cudaMemset(d_idata+n, 0, (size - n) * sizeof(int));
-  
-  cudaMalloc((void**)&d_indices, sizeof(int) * size);
-  cudaMalloc((void**)&d_odata, sizeof(int) * size);
-  cudaMalloc((void**)&d_bools, sizeof(int) * size);
-  
+  cudaMemset(d_idata + n, 0, (size - n) * sizeof(int));
+
+  cudaMalloc((void **)&d_indices, sizeof(int) * size);
+  cudaMalloc((void **)&d_odata, sizeof(int) * size);
+  cudaMalloc((void **)&d_bools, sizeof(int) * size);
+
   // Start computation
   timer().startGpuTimer();
 
   // Map and copy to new buffer for in place scan
-  StreamCompaction::Common::kernMapToBoolean<<<numBlocks, threadsPerBlock>>>(size, d_bools, d_idata);
+  StreamCompaction::Common::kernMapToBoolean<<<numBlocks, threadsPerBlock>>>(
+      size, d_bools, d_idata, StreamCompaction::Common::IsNonZero{});
   cudaMemcpy(d_indices, d_bools, sizeof(int) * size, cudaMemcpyDeviceToDevice);
 
   // parallel scan to get indices
-  parallel_scan(size, d_indices);
-  
+  parallel_scan_power2(size, d_indices);
+
   // Scatter to get output array
-  StreamCompaction::Common::kernScatter<<<numBlocks, threadsPerBlock>>>(size, d_odata, d_idata, d_bools, d_indices);
-  
+  StreamCompaction::Common::kernScatter<<<numBlocks, threadsPerBlock>>>(
+      size, d_odata, d_idata, d_bools, d_indices);
+
   timer().endGpuTimer();
   int last_bool;
   int last_index;
-  cudaMemcpy(&last_bool, d_bools + size - 1, sizeof(int), cudaMemcpyDeviceToHost);
-  cudaMemcpy(&last_index, d_indices + size - 1, sizeof(int), cudaMemcpyDeviceToHost);
+  cudaMemcpy(&last_bool, d_bools + size - 1, sizeof(int),
+             cudaMemcpyDeviceToHost);
+  cudaMemcpy(&last_index, d_indices + size - 1, sizeof(int),
+             cudaMemcpyDeviceToHost);
 
   int size_out = last_bool + last_index;
   cudaMemcpy(odata, d_odata, sizeof(int) * size_out, cudaMemcpyDeviceToHost);
-  
+
   // Free up allmemory
   cudaFree(d_idata);
   cudaFree(d_odata);

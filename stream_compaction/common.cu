@@ -17,21 +17,6 @@ void checkCUDAErrorFn(const char *msg, const char *file, int line) {
 
 namespace StreamCompaction {
     namespace Common {
-
-        /**
-         * Maps an array to an array of 0s and 1s for stream compaction. Elements
-         * which map to 0 will be removed, and elements which map to 1 will be kept.
-         */
-        __global__ void kernMapToBoolean(int n, int *bools, const int *idata) {
-            int tid = threadIdx.x + blockDim.x * blockIdx.x;
-
-            if (tid >= n) {
-                return;
-            }
-
-            bools[tid] = idata[tid] != 0;
-        }
-
         /**
          * Performs scatter on an array. That is, for each element in idata,
          * if bools[idx] == 1, it copies idata[idx] to odata[indices[idx]].
@@ -41,6 +26,17 @@ namespace StreamCompaction {
             int tid = threadIdx.x + blockDim.x * blockIdx.x;
 
             if (tid >= n || !bools[tid]) {
+                return;
+            }
+
+            odata[indices[tid]] = idata[tid];
+        }
+
+        __global__ void kernScatterAllElems(int n, int *odata,
+                const int *idata, const int *indices) {
+            int tid = threadIdx.x + blockDim.x * blockIdx.x;
+
+            if (tid >= n) {
                 return;
             }
 

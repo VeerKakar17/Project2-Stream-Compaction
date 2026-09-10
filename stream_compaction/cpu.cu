@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <algorithm>
 #include "cpu.h"
 
 #include "common.h"
@@ -86,6 +87,13 @@ namespace StreamCompaction {
             free(to_incl_arr);
             timer().endCpuTimer();
             return size_out;
+        }
+
+        void sort(int n, int *odata, const int *idata) {
+            timer().startCpuTimer();
+            std::copy(idata, idata + n, odata);
+            std::sort(odata, odata + n);
+            timer().endCpuTimer();
         }
     }
 }

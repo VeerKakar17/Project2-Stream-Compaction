@@ -32,10 +32,45 @@ inline int ilog2ceil(int x) {
 
 namespace StreamCompaction {
     namespace Common {
-        __global__ void kernMapToBoolean(int n, int *bools, const int *idata);
+        struct IsNonZero {
+            __host__ __device__ bool operator()(int x) const {
+                return x != 0;
+            }
+        };
+
+        struct IsZero{
+            __host__ __device__ bool operator()(int x) const {
+                return x == 0;
+            }
+        };
+
+        struct BitIsOne {
+            int bit;
+
+            __host__ __device__ bool operator()(int x) const {
+                return x & (1 << bit);
+            }
+        };
+
+#ifdef __CUDACC__
+        template <typename Predicate>
+        __global__ void kernMapToBoolean(int n, int *bools, const int *idata, Predicate pred) {
+            int tid = threadIdx.x + blockDim.x * blockIdx.x;
+
+            if (tid >= n) {
+                return;
+            }
+
+            bools[tid] = pred(idata[tid]);
+        }
+#endif
 
         __global__ void kernScatter(int n, int *odata,
                 const int *idata, const int *bools, const int *indices);
+
+        __global__ void kernScatterAllElems(int n, int *odata,
+                const int *idata, const int *indices);
+
 
         /**
         * This class is used for timing the performance
