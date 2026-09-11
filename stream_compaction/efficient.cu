@@ -25,17 +25,18 @@ __device__ int log2(int x) {
 __device__ int log2ceil(int x) { return x == 1 ? 0 : log2(x - 1) + 1; }
 
 __global__ void kernUpSweep(int n, int *data) {
-  int tid = threadIdx.x + blockDim.x * blockIdx.x;
+  int block_offset = blockDim.x * blockIdx.x;
+  int tid = threadIdx.x;
+  int chunk_size = n < blockDim.x ? n : blockDim.x;
 
   if (tid >= n) {
-
     return;
   }
 
   int d_pow = 1;
-  for (int d = 0; d <= log2ceil(n) - 1; d++) {
-    if ((n - tid) % (d_pow * 2) == 0) {
-      data[tid + (d_pow * 2) - 1] += data[tid + d_pow - 1];
+  for (int d = 0; d <= log2ceil(chunk_size) - 1; d++) {
+    if ((chunk_size - tid) % (d_pow * 2) == 0) {
+      data[block_offset + tid + (d_pow * 2) - 1] += data[block_offset + tid + d_pow - 1];
     }
 
     d_pow *= 2;
@@ -43,29 +44,45 @@ __global__ void kernUpSweep(int n, int *data) {
   }
 }
 
-__global__ void kernDownSweep(int n, int *data) {
-  int tid = threadIdx.x + blockDim.x * blockIdx.x;
+__global__ void kernDownSweep(int n, int *data, int *d_block_sums) {
+  int block_offset =  blockDim.x * blockIdx.x;
+  int tid = threadIdx.x;
+  int chunk_size = n < blockDim.x ? n : blockDim.x;
 
   if (tid >= n) {
     return;
   }
 
-  if (tid == n - 1) {
-    data[tid] = 0;
+  if (tid == chunk_size - 1) {
+    d_block_sums[blockIdx.x] = data[tid + block_offset];
+    data[block_offset + tid] = 0;
   }
 
-  int max_d = log2ceil(n) - 1;
+  int max_d = log2ceil(chunk_size) - 1;
   int d_pow = (int)powf(2, max_d);
   for (int d = max_d; d >= 0; d--) {
-    if ((n - tid) % (d_pow * 2) == 0) {
-      int t = data[tid + d_pow - 1];
-      data[tid + d_pow - 1] = data[tid + (d_pow * 2) - 1];
-      data[tid + (d_pow * 2) - 1] += t;
+    if ((chunk_size - tid) % (d_pow * 2) == 0) {
+      int t = data[block_offset + tid + d_pow - 1];
+      data[block_offset + tid + d_pow - 1] = data[block_offset + tid + (d_pow * 2) - 1];
+      data[block_offset + tid + (d_pow * 2) - 1] += t;
     }
     d_pow /= 2;
     __syncthreads();
   }
+
   __syncthreads();
+}
+
+__global__ void kernApplyBlockSums(int n, int b, int *data, int *block_sums) {
+  if (threadIdx.x >= n) {
+    return;
+  }
+
+  if (blockIdx.x >= b) {
+    return;
+  }
+
+  data[blockIdx.x * blockDim.x + threadIdx.x] += block_sums[blockIdx.x];
 }
 
 int round_to_next_pow2(int num) {
@@ -84,9 +101,17 @@ bool is_power_of_2(unsigned int x) { return x && ((x & (x - 1)) == 0); }
 
 void parallel_scan_power2(int n, int *data_device) {
   int numBlocks = (n + threadsPerBlock - 1) / threadsPerBlock;
+  int *d_block_sums;
 
+  cudaMalloc((void**)&d_block_sums, numBlocks * sizeof(int));
   kernUpSweep<<<numBlocks, threadsPerBlock>>>(n, data_device);
-  kernDownSweep<<<numBlocks, threadsPerBlock>>>(n, data_device);
+  kernDownSweep<<<numBlocks, threadsPerBlock>>>(n, data_device, d_block_sums);
+
+  if (numBlocks > 1) {
+    parallel_scan(numBlocks, d_block_sums);
+    kernApplyBlockSums<<<numBlocks, threadsPerBlock>>>(n, numBlocks, data_device, d_block_sums);
+  }
+
 }
 
 void parallel_scan(int n, int *data_device) {
@@ -188,9 +213,9 @@ int compact(int n, int *odata, const int *idata) {
   timer().endGpuTimer();
   int last_bool;
   int last_index;
-  cudaMemcpy(&last_bool, d_bools + size - 1, sizeof(int),
+  cudaMemcpy(&last_bool, d_bools + n - 1, sizeof(int),
              cudaMemcpyDeviceToHost);
-  cudaMemcpy(&last_index, d_indices + size - 1, sizeof(int),
+  cudaMemcpy(&last_index, d_indices + n - 1, sizeof(int),
              cudaMemcpyDeviceToHost);
 
   int size_out = last_bool + last_index;

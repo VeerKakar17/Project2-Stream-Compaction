@@ -16,9 +16,13 @@
 
 const int SIZE = 1 << 8; // feel free to change the size of array
 const int NPOT = SIZE - 3; // Non-Power-Of-Two
+const int LARGE_SIZE = 1 << 20; // Larger than one CUDA block
 int *a = new int[SIZE];
 int *b = new int[SIZE];
 int *c = new int[SIZE];
+int *largeA = new int[LARGE_SIZE];
+int *largeB = new int[LARGE_SIZE];
+int *largeC = new int[LARGE_SIZE];
 
 int main(int argc, char* argv[]) {
     // Scan tests
@@ -96,6 +100,23 @@ int main(int argc, char* argv[]) {
     //printArray(NPOT, c, true);
     printCmpResult(NPOT, b, c);
 
+    genArray(LARGE_SIZE - 1, largeA, 50);
+    largeA[LARGE_SIZE - 1] = 0;
+    printArray(LARGE_SIZE, largeA, true);
+
+    zeroArray(LARGE_SIZE, largeB);
+    printDesc("cpu scan, large");
+    StreamCompaction::CPU::scan(LARGE_SIZE, largeB, largeA);
+    printElapsedTime(StreamCompaction::CPU::timer().getCpuElapsedTimeForPreviousOperation(), "(std::chrono Measured)");
+    printArray(LARGE_SIZE, largeB, true);
+
+    zeroArray(LARGE_SIZE, largeC);
+    printDesc("work-efficient scan, large");
+    StreamCompaction::Efficient::scan(LARGE_SIZE, largeC, largeA);
+    printElapsedTime(StreamCompaction::Efficient::timer().getGpuElapsedTimeForPreviousOperation(), "(CUDA Measured)");
+    //printArray(LARGE_SIZE, largeC, true);
+    printCmpResult(LARGE_SIZE, largeB, largeC);
+
     printf("\n");
     printf("*****************************\n");
     printf("** STREAM COMPACTION TESTS **\n");
@@ -148,6 +169,25 @@ int main(int argc, char* argv[]) {
     //printArray(count, c, true);
     printCmpLenResult(count, expectedNPOT, b, c);
 
+    genArray(LARGE_SIZE - 1, largeA, 4);
+    largeA[LARGE_SIZE - 1] = 0;
+    printArray(LARGE_SIZE, largeA, true);
+
+    zeroArray(LARGE_SIZE, largeB);
+    printDesc("cpu compact without scan, large");
+    count = StreamCompaction::CPU::compactWithoutScan(LARGE_SIZE, largeB, largeA);
+    printElapsedTime(StreamCompaction::CPU::timer().getCpuElapsedTimeForPreviousOperation(), "(std::chrono Measured)");
+    expectedCount = count;
+    printArray(count, largeB, true);
+    printCmpLenResult(count, expectedCount, largeB, largeB);
+
+    zeroArray(LARGE_SIZE, largeC);
+    printDesc("work-efficient compact, large");
+    count = StreamCompaction::Efficient::compact(LARGE_SIZE, largeC, largeA);
+    printElapsedTime(StreamCompaction::Efficient::timer().getGpuElapsedTimeForPreviousOperation(), "(CUDA Measured)");
+    //printArray(count, largeC, true);
+    printCmpLenResult(count, expectedCount, largeB, largeC);
+
     printf("\n");
     printf("**********************\n");
     printf("** RADIX SORT TESTS **\n");
@@ -184,8 +224,27 @@ int main(int argc, char* argv[]) {
     //printArray(NPOT, c, true);
     printCmpResult(NPOT, b, c);
 
+    genArray(LARGE_SIZE, largeA, 50);
+    printArray(LARGE_SIZE, largeA, true);
+
+    zeroArray(LARGE_SIZE, largeB);
+    printDesc("cpu sort, large");
+    StreamCompaction::CPU::sort(LARGE_SIZE, largeB, largeA);
+    printElapsedTime(StreamCompaction::CPU::timer().getCpuElapsedTimeForPreviousOperation(), "(std::chrono Measured)");
+    printArray(LARGE_SIZE, largeB, true);
+
+    zeroArray(LARGE_SIZE, largeC);
+    printDesc("radix sort, large");
+    StreamCompaction::Radix::sort(LARGE_SIZE, largeC, largeA);
+    printElapsedTime(StreamCompaction::Radix::timer().getGpuElapsedTimeForPreviousOperation(), "(CUDA Measured)");
+    //printArray(LARGE_SIZE, largeC, true);
+    printCmpResult(LARGE_SIZE, largeB, largeC);
+
     system("pause"); // stop Win32 console from closing on exit
     delete[] a;
     delete[] b;
     delete[] c;
+    delete[] largeA;
+    delete[] largeB;
+    delete[] largeC;
 }
