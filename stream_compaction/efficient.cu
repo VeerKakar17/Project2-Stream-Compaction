@@ -12,7 +12,7 @@ PerformanceTimer &timer() {
   return timer;
 }
 
-const int threadsPerBlock = 1024;
+const int threadsPerBlock = 256;
 
 __device__ int log2(int x) {
   int lg = 0;
@@ -24,53 +24,58 @@ __device__ int log2(int x) {
 
 __device__ int log2ceil(int x) { return x == 1 ? 0 : log2(x - 1) + 1; }
 
-__global__ void kernUpSweep(int n, int *data) {
+__global__ void kernScan(int n, int *data, int *d_block_sums) {
+  //  up sweep
+  int chunk_size = n < blockDim.x ? n : blockDim.x;
   int block_offset = blockDim.x * blockIdx.x;
   int tid = threadIdx.x;
-  int chunk_size = n < blockDim.x ? n : blockDim.x;
 
   if (tid >= n) {
     return;
   }
 
+  extern __shared__ int s_data[];
+  s_data[tid] = data[block_offset + tid];
+  
   int d_pow = 1;
-  for (int d = 0; d <= log2ceil(chunk_size) - 1; d++) {
-    if ((chunk_size - tid) % (d_pow * 2) == 0) {
-      data[block_offset + tid + (d_pow * 2) - 1] += data[block_offset + tid + d_pow - 1];
+  int log_size = log2ceil(chunk_size);
+  __syncthreads();
+
+
+  for (int d = 0; d <= log_size - 1; d++) {
+    if (!((chunk_size - tid) & (d_pow*2-1))) {
+      s_data[tid + (d_pow * 2) - 1] += s_data[tid + d_pow - 1];
     }
 
     d_pow *= 2;
     __syncthreads();
   }
-}
 
-__global__ void kernDownSweep(int n, int *data, int *d_block_sums) {
-  int block_offset =  blockDim.x * blockIdx.x;
-  int tid = threadIdx.x;
-  int chunk_size = n < blockDim.x ? n : blockDim.x;
+  // down sweep
+  d_pow /= 2;
 
-  if (tid >= n) {
-    return;
-  }
+  int max_d = log_size - 1;
 
   if (tid == chunk_size - 1) {
-    d_block_sums[blockIdx.x] = data[tid + block_offset];
-    data[block_offset + tid] = 0;
+    if (d_block_sums != NULL) {
+      d_block_sums[blockIdx.x] = s_data[tid];
+    }
+    s_data[tid] = 0;
   }
 
-  int max_d = log2ceil(chunk_size) - 1;
-  int d_pow = (int)powf(2, max_d);
+  __syncthreads();
+
   for (int d = max_d; d >= 0; d--) {
-    if ((chunk_size - tid) % (d_pow * 2) == 0) {
-      int t = data[block_offset + tid + d_pow - 1];
-      data[block_offset + tid + d_pow - 1] = data[block_offset + tid + (d_pow * 2) - 1];
-      data[block_offset + tid + (d_pow * 2) - 1] += t;
+    if (!((chunk_size - tid) & (d_pow*2-1))) {
+      int t = s_data[tid + d_pow - 1];
+      s_data[tid + d_pow - 1] = s_data[tid + (d_pow * 2) - 1];
+      s_data[tid + (d_pow * 2) - 1] += t;
     }
     d_pow /= 2;
     __syncthreads();
   }
 
-  __syncthreads();
+  data[block_offset + tid] = s_data[tid];  
 }
 
 __global__ void kernApplyBlockSums(int n, int b, int *data, int *block_sums) {
@@ -101,17 +106,31 @@ bool is_power_of_2(unsigned int x) { return x && ((x & (x - 1)) == 0); }
 
 void parallel_scan_power2(int n, int *data_device) {
   int numBlocks = (n + threadsPerBlock - 1) / threadsPerBlock;
-  int *d_block_sums;
-
-  cudaMalloc((void**)&d_block_sums, numBlocks * sizeof(int));
-  kernUpSweep<<<numBlocks, threadsPerBlock>>>(n, data_device);
-  kernDownSweep<<<numBlocks, threadsPerBlock>>>(n, data_device, d_block_sums);
-
+  
+  int chunk_size = n < threadsPerBlock ? n : threadsPerBlock;
+  chunk_size *= sizeof(int);
+  
   if (numBlocks > 1) {
-    parallel_scan(numBlocks, d_block_sums);
-    kernApplyBlockSums<<<numBlocks, threadsPerBlock>>>(n, numBlocks, data_device, d_block_sums);
-  }
+    int *d_block_sums;
+    int block_size_arr_len = numBlocks;
+    if (!is_power_of_2(block_size_arr_len)) {
+      block_size_arr_len = round_to_next_pow2(block_size_arr_len);
+    }
 
+    cudaMalloc((void**)&d_block_sums, block_size_arr_len * sizeof(int));
+    if (block_size_arr_len > numBlocks) {
+      cudaMemset(d_block_sums+numBlocks, 0, sizeof(int) * (block_size_arr_len - numBlocks));
+    }
+    
+    kernScan<<<numBlocks, threadsPerBlock, chunk_size>>>(n, data_device, d_block_sums);
+    parallel_scan_power2(numBlocks, d_block_sums);
+    kernApplyBlockSums<<<numBlocks, threadsPerBlock>>>(n, numBlocks, data_device, d_block_sums);
+ 
+    cudaFree(d_block_sums);
+  } else {
+    kernScan<<<numBlocks, threadsPerBlock, chunk_size>>>(n, data_device, NULL);
+  }
+  
 }
 
 void parallel_scan(int n, int *data_device) {
