@@ -4,6 +4,10 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#define NUM_BANKS 32
+#define LOG_NUM_BANKS 5
+#define CONFLICT_FREE_OFFSET(n) (((n) >> LOG_NUM_BANKS) + ((n) >> (2 * LOG_NUM_BANKS)))
+
 namespace StreamCompaction {
 namespace Efficient {
 using StreamCompaction::Common::PerformanceTimer;
@@ -26,56 +30,72 @@ __device__ int log2ceil(int x) { return x == 1 ? 0 : log2(x - 1) + 1; }
 
 __global__ void kernScan(int n, int *data, int *d_block_sums) {
   //  up sweep
-  int chunk_size = n < blockDim.x ? n : blockDim.x;
-  int block_offset = blockDim.x * blockIdx.x;
+  int block_offset = 2 * blockDim.x * blockIdx.x;
+  int chunk_size = min(2 * blockDim.x, n - block_offset);
   int tid = threadIdx.x;
 
-  if (tid >= n) {
+  if (tid >= n / 2) {
     return;
   }
 
-  extern __shared__ int s_data[];
-  s_data[tid] = data[block_offset + tid];
   
-  int d_pow = 1;
-  int log_size = log2ceil(chunk_size);
+  int ai = tid;
+  int bi = tid + (chunk_size / 2);
+  int bankOffsetA = CONFLICT_FREE_OFFSET(ai);
+  int bankOffsetB = CONFLICT_FREE_OFFSET(bi);
+  
+  extern __shared__ int s_data[];
+  s_data[ai + bankOffsetA] = data[block_offset + ai];
+  s_data[bi + bankOffsetB] = data[block_offset + bi];
+
+  int offset = 1;
   __syncthreads();
 
 
-  for (int d = 0; d <= log_size - 1; d++) {
-    if (!((chunk_size - tid) & (d_pow*2-1))) {
-      s_data[tid + (d_pow * 2) - 1] += s_data[tid + d_pow - 1];
-    }
+  for (int d = chunk_size >> 1; d > 0; d >>= 1) {
+    if (tid < d) {
+      int ai = offset * (2 * tid + 1) - 1;
+      int bi = offset * (2 * tid + 2) - 1;
 
-    d_pow *= 2;
+      ai += CONFLICT_FREE_OFFSET(ai);
+      bi += CONFLICT_FREE_OFFSET(bi);
+
+      s_data[bi] += s_data[ai];
+    }
+    offset *= 2;
     __syncthreads();
   }
 
-  // down sweep
-  d_pow /= 2;
+  // Down sweep
 
-  int max_d = log_size - 1;
-
-  if (tid == chunk_size - 1) {
+  if (tid == (chunk_size / 2) - 1) {
     if (d_block_sums != NULL) {
-      d_block_sums[blockIdx.x] = s_data[tid];
+      d_block_sums[blockIdx.x] = s_data[bi + CONFLICT_FREE_OFFSET(bi)];
     }
-    s_data[tid] = 0;
+    s_data[bi + CONFLICT_FREE_OFFSET(bi)] = 0;
   }
 
   __syncthreads();
 
-  for (int d = max_d; d >= 0; d--) {
-    if (!((chunk_size - tid) & (d_pow*2-1))) {
-      int t = s_data[tid + d_pow - 1];
-      s_data[tid + d_pow - 1] = s_data[tid + (d_pow * 2) - 1];
-      s_data[tid + (d_pow * 2) - 1] += t;
-    }
-    d_pow /= 2;
+  for (int d = 1; d < chunk_size; d *= 2) {
+    offset >>= 1;
     __syncthreads();
-  }
+    if (tid < d) {
+      int ai = offset * (2 * tid + 1) - 1;
+      int bi = offset * (2 * tid + 2) - 1;
 
-  data[block_offset + tid] = s_data[tid];  
+      ai += CONFLICT_FREE_OFFSET(ai);
+      bi += CONFLICT_FREE_OFFSET(bi);
+
+      int t = s_data[ai];
+      s_data[ai] = s_data[bi];
+      s_data[bi] += t;
+    }
+  }
+  __syncthreads();
+
+  data[block_offset + ai] = s_data[ai + bankOffsetA];
+  data[block_offset + bi] = s_data[bi + bankOffsetB];  
 }
 
 __global__ void kernApplyBlockSums(int n, int b, int *data, int *block_sums) {
@@ -87,7 +107,15 @@ __global__ void kernApplyBlockSums(int n, int b, int *data, int *block_sums) {
     return;
   }
 
-  data[blockIdx.x * blockDim.x + threadIdx.x] += block_sums[blockIdx.x];
+  int tid = threadIdx.x;
+  int block_offset = 2 * blockDim.x * blockIdx.x;
+  int chunk_size = min(2 * blockDim.x, n - block_offset);
+
+  int ai = tid;
+  int bi = tid + (chunk_size / 2);
+
+  data[block_offset + ai] += block_sums[blockIdx.x];
+  data[block_offset + bi] += block_sums[blockIdx.x];
 }
 
 int round_to_next_pow2(int num) {
@@ -105,10 +133,11 @@ int round_to_next_pow2(int num) {
 bool is_power_of_2(unsigned int x) { return x && ((x & (x - 1)) == 0); }
 
 void parallel_scan_power2(int n, int *data_device) {
-  int numBlocks = (n + threadsPerBlock - 1) / threadsPerBlock;
+  int elemsPerBlock = threadsPerBlock * 2;
+  int numBlocks = (n + elemsPerBlock - 1) / elemsPerBlock;
   
-  int chunk_size = n < threadsPerBlock ? n : threadsPerBlock;
-  chunk_size *= sizeof(int);
+  int chunk_size = n < elemsPerBlock ? n : elemsPerBlock;
+  int shared_mem_size = (chunk_size + CONFLICT_FREE_OFFSET(chunk_size - 1)) * sizeof(int);
   
   if (numBlocks > 1) {
     int *d_block_sums;
@@ -122,13 +151,13 @@ void parallel_scan_power2(int n, int *data_device) {
       cudaMemset(d_block_sums+numBlocks, 0, sizeof(int) * (block_size_arr_len - numBlocks));
     }
     
-    kernScan<<<numBlocks, threadsPerBlock, chunk_size>>>(n, data_device, d_block_sums);
-    parallel_scan_power2(numBlocks, d_block_sums);
+    kernScan<<<numBlocks, threadsPerBlock, shared_mem_size>>>(n, data_device, d_block_sums);
+    parallel_scan_power2(block_size_arr_len, d_block_sums);
     kernApplyBlockSums<<<numBlocks, threadsPerBlock>>>(n, numBlocks, data_device, d_block_sums);
  
     cudaFree(d_block_sums);
   } else {
-    kernScan<<<numBlocks, threadsPerBlock, chunk_size>>>(n, data_device, NULL);
+    kernScan<<<numBlocks, threadsPerBlock, shared_mem_size>>>(n, data_device, NULL);
   }
   
 }
