@@ -71,6 +71,9 @@ namespace StreamCompaction {
         __global__ void kernScatterAllElems(int n, int *odata,
                 const int *idata, const int *indices);
 
+        int round_to_next_pow2(int num);
+        bool is_power_of_2(unsigned int x);
+
 
         /**
         * This class is used for timing the performance

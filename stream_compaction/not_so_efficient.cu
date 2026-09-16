@@ -1,22 +1,18 @@
 #include "common.h"
-#include "efficient.h"
+#include "not_so_efficient.h"
 // #include <__clang_cuda_builtin_vars.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-#define NUM_BANKS 32
-#define LOG_NUM_BANKS 5
-#define CONFLICT_FREE_OFFSET(n) (((n) >> LOG_NUM_BANKS) + ((n) >> (2 * LOG_NUM_BANKS)))
-
 namespace StreamCompaction {
-namespace Efficient {
+namespace NotSoEfficient {
 using StreamCompaction::Common::PerformanceTimer;
 PerformanceTimer &timer() {
   static PerformanceTimer timer;
   return timer;
 }
 
-const int threadsPerBlock = 256;
+const int threadsPerBlock = 128;
 
 __device__ int log2(int x) {
   int lg = 0;
@@ -28,78 +24,53 @@ __device__ int log2(int x) {
 
 __device__ int log2ceil(int x) { return x == 1 ? 0 : log2(x - 1) + 1; }
 
-__global__ void kernScan(int n, int *data, int *d_block_sums) {
-  //  up sweep
-  int block_offset = 2 * blockDim.x * blockIdx.x;
-  int chunk_size = min(2 * blockDim.x, n - block_offset);
+__global__ void kernUpSweep(int n, int *data) {
+  int block_offset = blockDim.x * blockIdx.x;
   int tid = threadIdx.x;
+  int chunk_size = min(blockDim.x, n - block_offset);
 
-  if (tid >= n / 2) {
-    return;
+  int d_pow = 1;
+  for (int d = 0; d <= log2ceil(chunk_size) - 1; d++) {
+    if (tid < chunk_size && (chunk_size - tid) % (d_pow * 2) == 0) {
+      data[block_offset + tid + (d_pow * 2) - 1] += data[block_offset + tid + d_pow - 1];
+    }
+
+    d_pow *= 2;
+    __syncthreads();
+  }
+}
+
+__global__ void kernDownSweep(int n, int *data, int *d_block_sums) {
+  int block_offset =  blockDim.x * blockIdx.x;
+  int tid = threadIdx.x;
+  int chunk_size = min(blockDim.x, n - block_offset);
+
+  if (tid == chunk_size - 1) {
+    d_block_sums[blockIdx.x] = data[tid + block_offset];
+    data[block_offset + tid] = 0;
   }
 
-  
-  int ai = tid;
-  int bi = tid + (chunk_size / 2);
-  int bankOffsetA = CONFLICT_FREE_OFFSET(ai);
-  int bankOffsetB = CONFLICT_FREE_OFFSET(bi);
-  
-  extern __shared__ int s_data[];
-  s_data[ai + bankOffsetA] = data[block_offset + ai];
-  s_data[bi + bankOffsetB] = data[block_offset + bi];
-
-  int offset = 1;
   __syncthreads();
 
-
-  for (int d = chunk_size >> 1; d > 0; d >>= 1) {
-    if (tid < d) {
-      int ai = offset * (2 * tid + 1) - 1;
-      int bi = offset * (2 * tid + 2) - 1;
-
-      ai += CONFLICT_FREE_OFFSET(ai);
-      bi += CONFLICT_FREE_OFFSET(bi);
-
-      s_data[bi] += s_data[ai];
+  int max_d = log2ceil(chunk_size) - 1;
+  int d_pow = (int)powf(2, max_d);
+  for (int d = max_d; d >= 0; d--) {
+    if (tid < chunk_size && (chunk_size - tid) % (d_pow * 2) == 0) {
+      int t = data[block_offset + tid + d_pow - 1];
+      data[block_offset + tid + d_pow - 1] = data[block_offset + tid + (d_pow * 2) - 1];
+      data[block_offset + tid + (d_pow * 2) - 1] += t;
     }
-    offset *= 2;
+    d_pow /= 2;
     __syncthreads();
   }
 
-  // Down sweep
-
-  if (tid == (chunk_size / 2) - 1) {
-    if (d_block_sums != NULL) {
-      d_block_sums[blockIdx.x] = s_data[bi + CONFLICT_FREE_OFFSET(bi)];
-    }
-    s_data[bi + CONFLICT_FREE_OFFSET(bi)] = 0;
-  }
-
   __syncthreads();
-
-  for (int d = 1; d < chunk_size; d *= 2) {
-    offset >>= 1;
-    __syncthreads();
-    if (tid < d) {
-      int ai = offset * (2 * tid + 1) - 1;
-      int bi = offset * (2 * tid + 2) - 1;
-
-      ai += CONFLICT_FREE_OFFSET(ai);
-      bi += CONFLICT_FREE_OFFSET(bi);
-
-      int t = s_data[ai];
-      s_data[ai] = s_data[bi];
-      s_data[bi] += t;
-    }
-  }
-  __syncthreads();
-
-  data[block_offset + ai] = s_data[ai + bankOffsetA];
-  data[block_offset + bi] = s_data[bi + bankOffsetB];  
 }
 
 __global__ void kernApplyBlockSums(int n, int b, int *data, int *block_sums) {
-  if (threadIdx.x >= n) {
+  int id = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (id >= n) {
     return;
   }
 
@@ -107,45 +78,23 @@ __global__ void kernApplyBlockSums(int n, int b, int *data, int *block_sums) {
     return;
   }
 
-  int tid = threadIdx.x;
-  int block_offset = 2 * blockDim.x * blockIdx.x;
-  int chunk_size = min(2 * blockDim.x, n - block_offset);
-
-  int ai = tid;
-  int bi = tid + (chunk_size / 2);
-
-  data[block_offset + ai] += block_sums[blockIdx.x];
-  data[block_offset + bi] += block_sums[blockIdx.x];
+  data[id] += block_sums[blockIdx.x];
 }
 
 void parallel_scan_power2(int n, int *data_device) {
-  int elemsPerBlock = threadsPerBlock * 2;
-  int numBlocks = (n + elemsPerBlock - 1) / elemsPerBlock;
-  
-  int chunk_size = n < elemsPerBlock ? n : elemsPerBlock;
-  int shared_mem_size = (chunk_size + CONFLICT_FREE_OFFSET(chunk_size - 1)) * sizeof(int);
-  
-  if (numBlocks > 1) {
-    int *d_block_sums;
-    int block_size_arr_len = numBlocks;
-    if (!StreamCompaction::Common::is_power_of_2(block_size_arr_len)) {
-      block_size_arr_len = StreamCompaction::Common::round_to_next_pow2(block_size_arr_len);
-    }
+  int numBlocks = (n + threadsPerBlock - 1) / threadsPerBlock;
+  int *d_block_sums;
 
-    cudaMalloc((void**)&d_block_sums, block_size_arr_len * sizeof(int));
-    if (block_size_arr_len > numBlocks) {
-      cudaMemset(d_block_sums+numBlocks, 0, sizeof(int) * (block_size_arr_len - numBlocks));
-    }
-    
-    kernScan<<<numBlocks, threadsPerBlock, shared_mem_size>>>(n, data_device, d_block_sums);
-    parallel_scan_power2(block_size_arr_len, d_block_sums);
+  cudaMalloc((void**)&d_block_sums, numBlocks * sizeof(int));
+  kernUpSweep<<<numBlocks, threadsPerBlock>>>(n, data_device);
+  kernDownSweep<<<numBlocks, threadsPerBlock>>>(n, data_device, d_block_sums);
+
+  if (numBlocks > 1) {
+    parallel_scan(numBlocks, d_block_sums);
     kernApplyBlockSums<<<numBlocks, threadsPerBlock>>>(n, numBlocks, data_device, d_block_sums);
- 
-    cudaFree(d_block_sums);
-  } else {
-    kernScan<<<numBlocks, threadsPerBlock, shared_mem_size>>>(n, data_device, NULL);
   }
-  
+
+  cudaFree(d_block_sums);
 }
 
 void parallel_scan(int n, int *data_device) {
@@ -264,5 +213,5 @@ int compact(int n, int *odata, const int *idata) {
   // Return
   return size_out;
 }
-} // namespace Efficient
+} // namespace NotSoEfficient
 } // namespace StreamCompaction
