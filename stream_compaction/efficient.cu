@@ -34,7 +34,7 @@ __global__ void kernScan(int n, int *data, int *d_block_sums) {
   int chunk_size = min(2 * blockDim.x, n - block_offset);
   int tid = threadIdx.x;
 
-  if (tid >= n / 2) {
+  if (tid >= chunk_size / 2) {
     return;
   }
 
