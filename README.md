@@ -47,6 +47,16 @@ If the block sums array is greater than one block, then it will recursively do t
 ### Efficient Scan
 This is the same efficient-GPU Scan with the up-sweep and down-sweep and non power-of-2 and large array semantics, except with hardware optimizations. This includes shared memory optimizations with no bank conflicts, minimal kernel calls, and optimizing access order.
 
+For the optimizations, this uses a shared memory array with size `2*blockSize` elements. This is because we now have each thread manage 2 elements, one corresponding to their `threadId` and one corresponding to their `threadId+blockSize/2` (note that if there are less than blockSize total elements, this uses n instead of blockSize).
+
+Now, we compute a conflict free offset for element `i` by doing `(i >> log(num_banks)) + (i >> (2 * log(num_banks)))`, and populating our shared memmory by storing the element at global memory index `i + block_offset` in index `i + conflict_free_offset(i)`, within each block. Note that block_offset is just an offset for each block within the total global array.
+By using this, we are able to guarantee there are no bank conflicts, and make our scan as efficient as possible. All we need to do for this is to make sure whenever we access shared memory, we use the special offset and use this when storing data back into global memory.
+
+Additionally, I combined the kernel down-sweep and up-sweep into a single kernel call `kernScan`, which reduces the kernel invocation overhead and gave an increase in performance.
+Lastly, I removed all instances of powers, logs, and modulos from the kernel. Instead, I changed the access order to compute the powers as it goes by bit shifting and have sequential threads doing work (so all threads doing work are grouped up at the lower thread ids less than a specified d, which is computed bby left or right shifting its value as we go through each level). 
+
+As seen with the performance analysis, this resulted in a significantly more efficient implementation, with an around 2x speedup on average.
+
 ### Thrust Scan
 This is the library GPU scan algorithm used for a baseline and benchmarking.
 
@@ -76,6 +86,18 @@ This is the thrust library GPU Stream Compaction used for benchmarking.
 ## Sort
 An additional feature I implemented is a parallel Radix sort.
 This is benchmarked against a standard CPU sort for reference, and uses the efficient Stream compaction with Map and Scatter to preform radix sort parallelized.
+
+This is called by using `StreamCompaction::RadixSort::sort` with the number of elements, pointer to input data array, and pointer to output data array.
+
+This works by doing one pass for each of the 32 bits in the integer. For each, it preforms a stable partition around that bit (putting 0s to the left and 1s to the right while maintaining previous order within each), by doing the following:
+- Calling Map to output a boolean array, with 1 for if the ith bit is 1, 0 otherwise
+- Calling Map on this same boolean array to get a new buffer with all the 1s and 0s swapped (using isZero as the condition)
+- Use scan on the map outputed by the second array to get the indices for all integers with this bit set to 0
+- Invoke another kernel to create a new buffer containing the index in the final array for all true elements. This works by taking the previous compacted sum and doing math with the index and the total number of elements with a bit of 0 to determine the index of all elements with this bit set to 1.
+- Invoke another kernel to determine the index of all elements. This checks if the ith bit is 0 or 1, and then sets the value in this array to either the index in the false buffer or the index from the true buffer.
+- Calls Scatter to rearrange all elements in the order specified by the last array.
+
+This allows us to sort all elements with just 32 passes, so as the block size gets very large, this results in much more efficient sorting than on the CPU.
 
 # Performance Analysis
 
